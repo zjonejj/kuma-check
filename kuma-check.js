@@ -1,57 +1,100 @@
 /**
  * Uptime Kuma 监控状态检查
- * 通过 Prometheus /metrics 获取所有监控项状态
- * 状态码: 1=UP, 0=DOWN, 2=PENDING, 3=MAINTENANCE
+ *
+ * 方案: 用 /api/badge/:id/status SVG 接口, 枚举所有 ID
+ * 优点: 不需要 auth, 能拿到所有 monitor 状态 (包括 paused/maintenance)
  *
  * 适用环境: Surge / Stash / Shadowrocket
+ *
+ * 配置: 修改下方 MONITOR_IDS 数组, 填入你的监控项 ID
  */
 
-const host = "https://uptime.xiangfang-ai.com";
-// Basic Auth: base64("user:uk2_mQwJQOBK7WpLCzZjlYtReXF_eDDNRn56ypKY2US5")
-const authBase64 = "dXNlcjp1azJfbVF3SlFPQks3V3BMQ3paamxZdFJlWEZfZURETlJuNTZ5cEtZMlVTNQ==";
+const HOST = "https://uptime.xiangfang-ai.com";
+// 你的监控项 ID 列表 (按需增减, 共 11 个)
+const MONITOR_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+// 并发数, 太大可能被限流
+const CONCURRENCY = 4;
 
-const myRequest = {
-    url: host + "/metrics",
-    headers: {
-        "Authorization": "Basic " + authBase64
+async function checkOne(id) {
+    const req = {
+        url: `${HOST}/api/badge/${id}/status`,
+        headers: { "Accept": "image/svg+xml" },
+    };
+    try {
+        const resp = await $task.fetch(req);
+        if (resp.statusCode !== 200) {
+            return { id, status: "ERR", msg: `HTTP ${resp.statusCode}` };
+        }
+        // SVG 格式: aria-label="Status: Up" 或 "Status: Down" 等
+        const m = resp.body.match(/aria-label="Status: ([^"]+)"/);
+        if (!m) {
+            return { id, status: "ERR", msg: "解析失败" };
+        }
+        return { id, status: m[1] };
+    } catch (e) {
+        return { id, status: "ERR", msg: e.error || "网络异常" };
     }
-};
+}
 
-$task.fetch(myRequest).then(response => {
-    if (response.statusCode !== 200) {
-        $notify("🔴 Kuma 请求异常", "", "HTTP " + response.statusCode);
-        $done();
-        return;
-    }
+async function runPool(ids, limit) {
+    const results = [];
+    const queue = ids.slice();
+    const workers = Array.from({ length: limit }, async () => {
+        while (queue.length) {
+            const id = queue.shift();
+            results.push(await checkOne(id));
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
 
-    const lines = response.body.split("\n");
+(async () => {
+    const results = await runPool(MONITOR_IDS, CONCURRENCY);
+
+    const STATUS_MAP = {
+        "Up": { icon: "🟢", text: "正常" },
+        "Down": { icon: "🔴", text: "故障" },
+        "Pending": { icon: "🟡", text: "等待" },
+        "Maintenance": { icon: "🔵", text: "维护" },
+    };
+
     const downList = [];
-    let total = 0;
+    const errList = [];
+    let up = 0;
 
-    for (const line of lines) {
-        if (!line.startsWith("monitor_status{")) continue;
-        total++;
-
-        const value = parseInt(line.split("} ")[1]);
-        if (value === 1) continue; // UP
-
-        const name = line.match(/monitor_name="([^"]+)"/)?.[1] || "未知";
-        const tag = value === 0 ? "DOWN" : value === 2 ? "PENDING" : "维护";
-        downList.push(name + " [" + tag + "]");
+    for (const r of results) {
+        if (r.status === "Up") {
+            up++;
+        } else if (r.status === "Down") {
+            downList.push(`#${r.id} 故障`);
+        } else if (r.status === "Pending") {
+            downList.push(`#${r.id} 等待中`);
+        } else if (r.status === "Maintenance") {
+            downList.push(`#${r.id} 维护中`);
+        } else {
+            errList.push(`#${r.id} ${r.msg}`);
+        }
     }
 
-    if (downList.length > 0) {
+    if (errList.length > 0) {
         $notify(
-            "🔴 Kuma " + downList.length + "/" + total + " 异常",
-            "",
+            "🔴 Kuma 请求异常",
+            `${up} 正常 / ${errList.length} 失败`,
+            errList.join("\n")
+        );
+    } else if (downList.length > 0) {
+        $notify(
+            `🔴 Kuma ${downList.length} 异常`,
+            `${up}/${MONITOR_IDS.length} 正常`,
             downList.join("\n")
         );
     } else {
-        $notify("🟢 Kuma 正常", "", "全部 " + total + " 个服务在线");
+        $notify(
+            "🟢 Kuma 全部正常",
+            `${up}/${MONITOR_IDS.length} 在线`,
+            ""
+        );
     }
-
     $done();
-}, reason => {
-    $notify("🔴 Kuma 无法连接", "", "请求失败: " + (reason.error || "网络异常"));
-    $done();
-});
+})();
